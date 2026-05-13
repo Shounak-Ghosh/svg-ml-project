@@ -1,5 +1,8 @@
+.DS_Store
 # Data folder
 data/
+# Model checkpoints
+*_ckpt.pt
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

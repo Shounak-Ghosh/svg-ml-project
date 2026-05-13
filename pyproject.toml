@@ -8,5 +8,8 @@ dependencies = [
     "cairosvg>=2.9.0",
     "datasets>=4.8.5",
     "lxml>=6.1.0",
+    "matplotlib>=3.10.9",
+    "scipy>=1.17.1",
     "tokenizers>=0.23.1",
+    "torch>=2.11.0",
 ]
