@@ -1,0 +1,174 @@
+# This is a base shape file encoded in yaml
+# - `null` indicates a dimension is "finite", i.e. a non-"width" dimension
+# - a number indicates the base dimension of an "infinite" dimension, i.e. some notion of "width"
+lm_head.weight:
+- null
+- 64
+transformer.h.0.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.0.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.0.ln_1.weight:
+- 64
+transformer.h.0.ln_2.weight:
+- 64
+transformer.h.0.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.0.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.1.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.1.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.1.ln_1.weight:
+- 64
+transformer.h.1.ln_2.weight:
+- 64
+transformer.h.1.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.1.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.2.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.2.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.2.ln_1.weight:
+- 64
+transformer.h.2.ln_2.weight:
+- 64
+transformer.h.2.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.2.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.3.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.3.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.3.ln_1.weight:
+- 64
+transformer.h.3.ln_2.weight:
+- 64
+transformer.h.3.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.3.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.4.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.4.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.4.ln_1.weight:
+- 64
+transformer.h.4.ln_2.weight:
+- 64
+transformer.h.4.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.4.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.5.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.5.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.5.ln_1.weight:
+- 64
+transformer.h.5.ln_2.weight:
+- 64
+transformer.h.5.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.5.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.6.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.6.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.6.ln_1.weight:
+- 64
+transformer.h.6.ln_2.weight:
+- 64
+transformer.h.6.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.6.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.7.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.7.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.7.ln_1.weight:
+- 64
+transformer.h.7.ln_2.weight:
+- 64
+transformer.h.7.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.7.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.8.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.8.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.8.ln_1.weight:
+- 64
+transformer.h.8.ln_2.weight:
+- 64
+transformer.h.8.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.8.mlp.c_proj.weight:
+- 64
+- 256
+transformer.h.9.attn.c_attn.weight:
+- 192
+- 64
+transformer.h.9.attn.c_proj.weight:
+- 64
+- 64
+transformer.h.9.ln_1.weight:
+- 64
+transformer.h.9.ln_2.weight:
+- 64
+transformer.h.9.mlp.c_fc.weight:
+- 256
+- 64
+transformer.h.9.mlp.c_proj.weight:
+- 64
+- 256
+transformer.ln_f.weight:
+- 64
+transformer.wpe.weight:
+- null
+- 64
+transformer.wte.weight:
+- null
+- 64
