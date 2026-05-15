@@ -117,6 +117,13 @@ def train_mup(args: argparse.Namespace) -> dict:
     n_params = model.count_parameters()
     log.info(f"muP model '{args.model_size}': {n_params:,} parameters")
 
+    if args.resume_ckpt:
+        log.info(f"Resuming weights from: {args.resume_ckpt}")
+        resume_data = torch.load(args.resume_ckpt, map_location="cpu", weights_only=False)
+        raw_for_load = model._orig_mod if hasattr(model, "_orig_mod") else model
+        raw_for_load.load_state_dict(resume_data["model_state_dict"])
+        log.info(f"  Resumed from val_loss={resume_data.get('val_loss', 'unknown')}")
+
     if args.compile and hasattr(torch, "compile"):
         log.info("Compiling model with torch.compile() ...")
         model = torch.compile(model)   # type: ignore[assignment]
@@ -156,14 +163,16 @@ def train_mup(args: argparse.Namespace) -> dict:
         pin_memory=(device_type == "cuda"),
     )
 
-    total_steps = len(train_loader)
+    steps_per_epoch = len(train_loader)
+    total_steps     = args.n_epochs * steps_per_epoch
     if args.max_steps is not None:
         total_steps = min(args.max_steps, total_steps)
 
     warmup_steps    = max(1, round(args.warmup_ratio * total_steps))
     tokens_per_step = args.batch_size * args.block_size
     log.info(
-        f"Training: {total_steps} steps | warmup={warmup_steps} | "
+        f"Training: {args.n_epochs} epoch(s) × {steps_per_epoch} steps = "
+        f"{total_steps} total steps | warmup={warmup_steps} | "
         f"{tokens_per_step * total_steps / 1e6:.1f}M tokens"
     )
 
@@ -183,6 +192,8 @@ def train_mup(args: argparse.Namespace) -> dict:
         "model_size":     args.model_size,
         "n_params":       n_params,
         "lr":             args.lr,
+        "n_epochs":       args.n_epochs,
+        "resumed_from":   args.resume_ckpt,
         "train_losses":   [],
         "val_loss":       None,
         "wall_clock_s":   None,
@@ -194,44 +205,48 @@ def train_mup(args: argparse.Namespace) -> dict:
     t0          = time.perf_counter()
     tokens_seen = 0
     log_every   = max(1, total_steps // 200)
+    step        = 0
 
-    train_iter = iter(train_loader)
-    for step in range(total_steps):
-        try:
-            x, y = next(train_iter)
-        except StopIteration:
+    for epoch in range(args.n_epochs):
+        train_iter = iter(train_loader)
+        for x, y in train_iter:
+            if step >= total_steps:
+                break
+
+            x, y = x.to(device), y.to(device)
+
+            # Cosine LR schedule — preserve per-group width_mult ratios
+            # initial_lrs[i] = args.lr / width_mult_i  (set by MuAdamW at creation)
+            # g['lr'] = initial_lrs[i] * (lr_t / args.lr) = lr_t / width_mult_i
+            lr_t = get_lr(step, warmup_steps, total_steps, args.lr, args.lr * args.lr_decay_ratio)
+            for g, init_lr in zip(optimizer.param_groups, initial_lrs):
+                g["lr"] = init_lr * (lr_t / args.lr)
+
+            with ctx:
+                _, loss = model(x, y)
+
+            loss.backward()
+            if args.grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+            tokens_seen += x.numel()
+            step        += 1
+
+            if step % log_every == 0 or step == total_steps:
+                elapsed = time.perf_counter() - t0
+                tps = tokens_seen / elapsed if elapsed > 0 else 0.0
+                results["train_losses"].append(
+                    {"step": step, "epoch": epoch, "loss": round(loss.item(), 5), "lr": lr_t}
+                )
+                log.info(
+                    f"  epoch {epoch+1}/{args.n_epochs} step {step:5d}/{total_steps} | "
+                    f"loss {loss.item():.4f} | lr {lr_t:.2e} | {tps:,.0f} tok/s"
+                )
+
+        if step >= total_steps:
             break
-
-        x, y = x.to(device), y.to(device)
-
-        # Cosine LR schedule — preserve per-group width_mult ratios
-        # initial_lrs[i] = args.lr / width_mult_i  (set by MuAdamW at creation)
-        # g['lr'] = initial_lrs[i] * (lr_t / args.lr) = lr_t / width_mult_i
-        lr_t = get_lr(step, warmup_steps, total_steps, args.lr, args.lr * args.lr_decay_ratio)
-        for g, init_lr in zip(optimizer.param_groups, initial_lrs):
-            g["lr"] = init_lr * (lr_t / args.lr)
-
-        with ctx:
-            _, loss = model(x, y)
-
-        loss.backward()
-        if args.grad_clip > 0.0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-
-        tokens_seen += x.numel()
-
-        if step % log_every == 0 or step == total_steps - 1:
-            elapsed = time.perf_counter() - t0
-            tps = tokens_seen / elapsed if elapsed > 0 else 0.0
-            results["train_losses"].append(
-                {"step": step, "loss": round(loss.item(), 5), "lr": lr_t}
-            )
-            log.info(
-                f"  step {step:5d}/{total_steps} | "
-                f"loss {loss.item():.4f} | lr {lr_t:.2e} | {tps:,.0f} tok/s"
-            )
 
     # ── end-of-epoch metrics ───────────────────────────────────────────────
     wall_clock = time.perf_counter() - t0
@@ -261,7 +276,7 @@ def train_mup(args: argparse.Namespace) -> dict:
     )
 
     # ── persist results ────────────────────────────────────────────────────
-    run_tag      = f"{args.model_size}_lr{args.lr:.0e}_mup"
+    run_tag      = f"{args.model_size}_lr{args.lr:.0e}_{args.n_epochs}ep_mup"
     results_path = mup_out_dir / f"{run_tag}_results.json"
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
@@ -369,6 +384,10 @@ def parse_args_mup(argv=None) -> argparse.Namespace:
     p.add_argument("--grad_clip",       type=float, default=1.0)
     p.add_argument("--warmup_ratio",    type=float, default=0.05)
     p.add_argument("--max_steps",       type=int,   default=None)
+    p.add_argument("--n_epochs",        type=int,   default=1,
+                   help="Number of full training epochs (cosine LR spans all epochs)")
+    p.add_argument("--resume_ckpt",     type=str,   default=None,
+                   help="Path to a .pt checkpoint to resume model weights from")
     p.add_argument("--num_workers",     type=int,   default=0)
     p.add_argument("--seed",            type=int,   default=42)
     p.add_argument("--device",          default=(

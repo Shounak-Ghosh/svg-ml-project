@@ -215,6 +215,48 @@ class SVGTransformerMuP(nn.Module):
                 total += p.numel()
         return total
 
+    @torch.no_grad()
+    def generate(
+        self,
+        idx: torch.Tensor,
+        max_new_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        eos_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        """
+        Autoregressive generation. Mirrors SVGTransformer.generate() exactly.
+
+        When targets=None, the muP forward pass returns logits of shape
+        (B, 1, vocab_size) — only the last token position. The slice
+        logits[:, -1, :] still gives (B, vocab_size) correctly.
+        """
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / temperature   # (B, vocab_size)
+
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float("-inf")
+
+            if top_p is not None:
+                sorted_logits, sorted_idx = torch.sort(logits, descending=True)
+                cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                remove = cum_probs - F.softmax(sorted_logits, dim=-1) > top_p
+                sorted_logits[remove] = float("-inf")
+                logits = torch.zeros_like(logits).scatter_(1, sorted_idx, sorted_logits)
+
+            probs    = F.softmax(logits, dim=-1)
+            next_tok = torch.multinomial(probs, num_samples=1)
+            idx      = torch.cat([idx, next_tok], dim=1)
+
+            if eos_id is not None and (next_tok == eos_id).all():
+                break
+
+        return idx
+
     def configure_optimizers_mup(
         self,
         weight_decay: float,
