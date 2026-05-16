@@ -11,6 +11,7 @@ Usage:
 """
 
 import sys
+import os
 import json
 import time
 import argparse
@@ -74,8 +75,8 @@ def load_model(
     Load a checkpoint and reconstruct the model.
 
     Auto-detects model type by presence of 'base_shapes_path' key:
-      present  → SVGTransformerMuP
-      absent   → SVGTransformer (SP)
+      present  --> SVGTransformerMuP
+      absent   --> SVGTransformer (SP)
     """
     log.info(f"Loading checkpoint: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -84,7 +85,7 @@ def load_model(
     is_mup = "base_shapes_path" in ckpt
 
     if is_mup:
-        base_shapes_path = ckpt["base_shapes_path"]
+        base_shapes_path = ckpt["base_shapes_path"].replace("\\", "/")
         if not Path(base_shapes_path).exists():
             base_shapes_path = str(Path(ckpt_path).parent / Path(base_shapes_path).name)
         log.info(f"muP model detected; base_shapes: {base_shapes_path}")
@@ -123,45 +124,56 @@ def generate_unconditional(
     temperatures: Optional[list] = None,
     top_k: int = 50,
     top_p: float = 0.9,
+    greedy: bool = False,
+    prime_eos: bool = False,
 ) -> list:
     """
     Generate n_samples unconditional SVGs starting from <bos>.
 
     Distributes samples evenly across the given temperatures.
+
+    prime_eos: prepend EOS before BOS so the model sees the EOS→BOS transition
+               it was trained on (packed-sequence datasets almost always have
+               a preceding EOS before each BOS in training chunks).
+    greedy: if True, ignore temperatures and always pick the argmax token.
     """
     if temperatures is None:
         temperatures = [0.5, 0.8, 1.0]
 
+    seed_ids = [EOS_ID, BOS_ID] if prime_eos else [BOS_ID]
+    n_seed   = len(seed_ids)
+
     results = []
     for i in range(n_samples):
-        temp = temperatures[i % len(temperatures)]
-        seed = torch.tensor([[BOS_ID]], dtype=torch.long, device=device)
+        temp = 1.0 if greedy else temperatures[i % len(temperatures)]
+        seed = torch.tensor([seed_ids], dtype=torch.long, device=device)
 
         t0 = time.perf_counter()
         generated = model.generate(
             seed,
             max_new_tokens=max_new_tokens,
             temperature=temp,
-            top_k=top_k,
-            top_p=top_p,
+            top_k=(1 if greedy else top_k),
+            top_p=(None if greedy else top_p),
             eos_id=EOS_ID,
         )
         elapsed = time.perf_counter() - t0
 
-        token_ids = generated[0].tolist()
-        svg_text  = decode_tokens(token_ids, tokenizer)
-        n_generated = len(token_ids) - 1  # subtract seed bos
+        token_ids   = generated[0].tolist()
+        svg_text    = decode_tokens(token_ids, tokenizer)
+        n_generated = len(token_ids) - n_seed
 
         results.append({
             "name":             f"unconditional_{i:02d}",
             "svg":              svg_text,
-            "temperature":      temp,
-            "top_k":            top_k,
-            "top_p":            top_p,
+            "temperature":      0.0 if greedy else temp,
+            "top_k":            1 if greedy else top_k,
+            "top_p":            0.0 if greedy else top_p,
             "tokens_generated": n_generated,
             "elapsed_s":        round(elapsed, 2),
         })
-        log.info(f"  [{i+1:02d}/{n_samples}] temp={temp} | {n_generated} tokens | {elapsed:.1f}s")
+        mode = "greedy" if greedy else f"temp={temp}"
+        log.info(f"  [{i+1:02d}/{n_samples}] {mode} | {n_generated} tokens | {elapsed:.1f}s")
 
     return results
 
@@ -176,6 +188,7 @@ def generate_from_prefix(
     temperature: float = 0.8,
     top_k: int = 50,
     top_p: float = 0.9,
+    greedy: bool = False,
 ) -> dict:
     """Complete an SVG from a given prefix string."""
     prefix_ids = encode_no_special(prefix_text, tokenizer)
@@ -188,9 +201,9 @@ def generate_from_prefix(
     generated = model.generate(
         seed,
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
+        temperature=1.0 if greedy else temperature,
+        top_k=1 if greedy else top_k,
+        top_p=None if greedy else top_p,
         eos_id=EOS_ID,
     )
     elapsed = time.perf_counter() - t0
@@ -199,19 +212,64 @@ def generate_from_prefix(
     svg_text    = decode_tokens(token_ids, tokenizer)
     n_generated = len(token_ids) - len(seed_ids)
 
-    log.info(f"    → {n_generated} new tokens | {elapsed:.1f}s")
+    log.info(f"    --> {n_generated} new tokens | {elapsed:.1f}s")
 
     return {
         "name":             f"prefix_{prefix_name}",
         "prefix_text":      prefix_text,
         "svg":              svg_text,
-        "temperature":      temperature,
-        "top_k":            top_k,
-        "top_p":            top_p,
+        "temperature":      0.0 if greedy else temperature,
+        "top_k":            1 if greedy else top_k,
+        "top_p":            0.0 if greedy else top_p,
         "prefix_tokens":    len(prefix_ids),
         "tokens_generated": n_generated,
         "elapsed_s":        round(elapsed, 2),
     }
+
+
+def render_svg(svg_path: Path) -> bool:
+    """Render an SVG file to PNG using cairosvg. Returns True on success."""
+    try:
+        # cairocffi (used by cairosvg) calls dlopen() at import time. On macOS with
+        # Homebrew on Apple Silicon the library lives in /opt/homebrew/lib, which is
+        # not in the default dyld search path, so we add it before the import.
+        _brew_lib = "/opt/homebrew/lib"
+        if os.path.isdir(_brew_lib):
+            os.environ["DYLD_LIBRARY_PATH"] = (
+                _brew_lib + ":" + os.environ.get("DYLD_LIBRARY_PATH", "")
+            ).rstrip(":")
+        
+        import cairosvg  # lazy import — optional dependency
+    except ImportError:
+        log.warning("cairosvg not installed; skipping render. Run: pip install cairosvg")
+        return False
+
+    png_path = svg_path.with_suffix(".png")
+    svg_text = svg_path.read_text(encoding="utf-8")
+
+    def _try_render(text: str) -> bool:
+        try:
+            cairosvg.svg2png(bytestring=text.encode(), write_to=str(png_path))
+            return True
+        except Exception:
+            return False
+
+    if _try_render(svg_text):
+        return True
+
+    # Recovery: if the SVG is truncated (no closing tag), append </svg> and retry
+    if "</svg>" not in svg_text.lower():
+        if _try_render(svg_text + "</svg>"):
+            svg_path.write_text(svg_text + "</svg>", encoding="utf-8")
+            log.info(f"  Recovered {svg_path.name} by appending </svg>")
+            return True
+
+    # Log the underlying error from the original attempt
+    try:
+        cairosvg.svg2png(bytestring=svg_text.encode(), write_to=str(png_path))
+    except Exception as e:
+        log.warning(f"  Render failed for {svg_path.name}: {e}")
+    return False
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -225,13 +283,27 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--out_dir", default="transformer/runs/generated/")
     p.add_argument("--n_unconditional", type=int, default=10,
                    help="Number of unconditional samples to generate")
-    p.add_argument("--max_new_tokens", type=int, default=512)
+    p.add_argument("--max_new_tokens", type=int, default=1024)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default=(
         "cuda" if torch.cuda.is_available()
         else "mps" if torch.backends.mps.is_available()
         else "cpu"
     ))
+    p.add_argument("--render", action="store_true",
+                   help="Render each SVG to PNG via cairosvg (requires: pip install cairosvg)")
+    p.add_argument("--greedy", action="store_true",
+                   help="Greedy decoding (argmax at each step); overrides temperature/top_k/top_p")
+    p.add_argument("--prime_eos", action="store_true",
+                   help="Seed unconditional generation with [EOS, BOS] instead of [BOS]. "
+                        "Matches the EOS→BOS transition seen in packed-sequence training.")
+    p.add_argument("--temperatures", type=float, nargs="+", default=[0.5, 0.8, 1.0],
+                   metavar="T",
+                   help="Temperatures cycled across unconditional samples")
+    p.add_argument("--prefix_temperature", type=float, default=0.8,
+                   help="Temperature for prefix-conditioned generation")
+    p.add_argument("--top_k", type=int, default=50)
+    p.add_argument("--top_p", type=float, default=0.9)
     return p.parse_args(argv)
 
 
@@ -251,13 +323,19 @@ def main() -> None:
 
     # ── unconditional generation ───────────────────────────────────────────
     log.info(f"\nGenerating {args.n_unconditional} unconditional samples ...")
+    if args.greedy:
+        log.info("  (greedy decoding)")
+    if args.prime_eos:
+        log.info("  (priming with [EOS, BOS])")
     unconditional = generate_unconditional(
         model, tokenizer, args.device,
         n_samples=args.n_unconditional,
         max_new_tokens=args.max_new_tokens,
-        temperatures=[0.5, 0.8, 1.0],
-        top_k=50,
-        top_p=0.9,
+        temperatures=args.temperatures,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        greedy=args.greedy,
+        prime_eos=args.prime_eos,
     )
     all_results.extend(unconditional)
 
@@ -269,16 +347,25 @@ def main() -> None:
             prefix_name=name,
             prefix_text=prefix_text,
             max_new_tokens=args.max_new_tokens,
-            temperature=0.8,
-            top_k=50,
-            top_p=0.9,
+            temperature=args.prefix_temperature,
+            top_k=args.top_k,
+            top_p=args.top_p,
+            greedy=args.greedy,
         )
         all_results.append(result)
 
     # ── save outputs ───────────────────────────────────────────────────────
     log.info(f"\nSaving {len(all_results)} samples to {out_dir} ...")
+    n_rendered = 0
     for r in all_results:
-        (out_dir / f"{r['name']}.svg").write_text(r["svg"], encoding="utf-8")
+        svg_path = out_dir / f"{r['name']}.svg"
+        svg_path.write_text(r["svg"], encoding="utf-8")
+        if args.render:
+            if render_svg(svg_path):
+                n_rendered += 1
+
+    if args.render:
+        log.info(f"Rendered {n_rendered}/{len(all_results)} SVGs to PNG")
 
     metadata = {
         "ckpt":           args.ckpt,

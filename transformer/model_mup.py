@@ -161,7 +161,7 @@ class SVGTransformerMuP(nn.Module):
                 nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Linear):
             if hasattr(module.weight, "infshape"):
-                # infshape set → training model: use width-aware muP init
+                # infshape set --> training model: use width-aware muP init
                 # kaiming_normal_ with fan_in + linear gives std = 1/sqrt(fan_in),
                 # then mup scales by sqrt(base_fan_in / fan_in) for "infinite" dims
                 mu_init.kaiming_normal_(

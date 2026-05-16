@@ -4,8 +4,8 @@ muP training script for SVG Transformer scaling study (Part 3).
 Mirrors train.py but uses SVGTransformerMuP and MuAdamW so that the optimal
 learning rate found on the Tiny model transfers zero-shot to all larger widths.
 
-Shared utilities (SVGDataset, tokenize_file, get_lr, evaluate) are imported
-directly from train.py to avoid duplication.
+Shared utilities (SVGSequenceDataset, tokenize_file_to_sequences, pad_collate,
+get_lr, evaluate) are imported directly from train.py to avoid duplication.
 
 Usage
 -----
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from model import MODEL_CONFIGS
 from model_mup import SVGTransformerMuP, create_mup_base_shapes
 # Reuse data / schedule / eval helpers — no duplication
-from train import SVGDataset, tokenize_file, get_lr, evaluate
+from train import SVGSequenceDataset, tokenize_file_to_sequences, pad_collate, get_lr, evaluate
 
 logging.basicConfig(
     level=logging.INFO,
@@ -131,19 +131,27 @@ def train_mup(args: argparse.Namespace) -> dict:
     # ── data ───────────────────────────────────────────────────────────────
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
 
-    def cache_path(split: str) -> Optional[str]:
+    def flat_cache(split: str) -> Optional[str]:
         if cache_dir is None:
             return None
         return str(cache_dir / f"{split}_bs{args.block_size}_tokens.npy")
 
-    train_tokens = tokenize_file(args.train_path, tokenizer, cache_path("train"))
-    val_tokens   = tokenize_file(args.val_path,   tokenizer, cache_path("val"))
+    def offsets_cache(split: str) -> Optional[str]:
+        if cache_dir is None:
+            return None
+        return str(cache_dir / f"{split}_seq_offsets.npy")
 
-    train_ds = SVGDataset(train_tokens, args.block_size)
-    val_ds   = SVGDataset(val_tokens,   args.block_size)
+    train_tokens, train_offsets = tokenize_file_to_sequences(
+        args.train_path, tokenizer, flat_cache("train"), offsets_cache("train"))
+    val_tokens, val_offsets = tokenize_file_to_sequences(
+        args.val_path, tokenizer, flat_cache("val"), offsets_cache("val"))
+
+    filter_long = not args.no_filter_long
+    train_ds = SVGSequenceDataset(train_tokens, train_offsets, args.block_size, filter_long=filter_long)
+    val_ds   = SVGSequenceDataset(val_tokens,   val_offsets,   args.block_size, filter_long=filter_long)
 
     log.info(
-        f"Dataset: train={len(train_ds):,} blocks, val={len(val_ds):,} blocks "
+        f"Dataset: train={len(train_ds):,} sequences, val={len(val_ds):,} sequences "
         f"(block_size={args.block_size})"
     )
 
@@ -154,6 +162,7 @@ def train_mup(args: argparse.Namespace) -> dict:
         num_workers=args.num_workers,
         pin_memory=(device_type == "cuda"),
         drop_last=True,
+        collate_fn=pad_collate,
     )
     val_loader = DataLoader(
         val_ds,
@@ -161,6 +170,7 @@ def train_mup(args: argparse.Namespace) -> dict:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device_type == "cuda"),
+        collate_fn=pad_collate,
     )
 
     steps_per_epoch = len(train_loader)
@@ -168,12 +178,12 @@ def train_mup(args: argparse.Namespace) -> dict:
     if args.max_steps is not None:
         total_steps = min(args.max_steps, total_steps)
 
-    warmup_steps    = max(1, round(args.warmup_ratio * total_steps))
-    tokens_per_step = args.batch_size * args.block_size
+    warmup_steps = max(1, round(args.warmup_ratio * total_steps))
+    avg_seq_len  = len(train_tokens) / max(1, len(train_ds))
     log.info(
         f"Training: {args.n_epochs} epoch(s) × {steps_per_epoch} steps = "
         f"{total_steps} total steps | warmup={warmup_steps} | "
-        f"{tokens_per_step * total_steps / 1e6:.1f}M tokens"
+        f"{len(train_ds):,} sequences (avg {avg_seq_len:.0f} tokens each)"
     )
 
     # ── optimizer ──────────────────────────────────────────────────────────
@@ -397,6 +407,8 @@ def parse_args_mup(argv=None) -> argparse.Namespace:
     ))
     p.add_argument("--compile",         action="store_true")
     p.add_argument("--save_checkpoint", action="store_true")
+    p.add_argument("--no_filter_long",  action="store_true",
+                   help="Disable filtering of sequences longer than block_size")
 
     # LR sweep options
     p.add_argument("--lr_sweep_min", type=float, default=1e-5)

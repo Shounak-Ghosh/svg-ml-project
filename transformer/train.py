@@ -108,7 +108,7 @@ def tokenize_file(
 
 class SVGDataset(Dataset):
     """
-    Packed-sequence dataset.
+    Packed-sequence dataset (original implementation, kept for reference).
 
     Slices a flat token array into non-overlapping (input, target) pairs of
     length block_size, with target = input shifted right by one position.
@@ -119,7 +119,6 @@ class SVGDataset(Dataset):
     def __init__(self, token_array: np.ndarray, block_size: int):
         self.data       = token_array
         self.block_size = block_size
-        # Number of complete pairs we can extract without running off the end
         self.n_blocks   = (len(token_array) - 1) // block_size
 
     def __len__(self) -> int:
@@ -128,8 +127,153 @@ class SVGDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = idx * self.block_size
         chunk = self.data[start : start + self.block_size + 1].astype(np.int64)
-        x = torch.from_numpy(chunk[:-1])  # input tokens
-        y = torch.from_numpy(chunk[1:])   # target tokens (shifted by 1)
+        x = torch.from_numpy(chunk[:-1])
+        y = torch.from_numpy(chunk[1:])
+        return x, y
+
+
+def tokenize_file_to_sequences(
+    txt_path: str,
+    tokenizer: Tokenizer,
+    flat_cache_path: Optional[str] = None,
+    offsets_cache_path: Optional[str] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Tokenize an SVG .txt file into a flat uint16 token array and a per-sequence
+    offsets array, so each SVG can be retrieved individually.
+
+    Returns:
+        flat_tokens : uint16 array — all tokens concatenated
+        offsets     : int64 array of shape (n_seqs + 1,); sequence i spans
+                      flat_tokens[offsets[i] : offsets[i+1]]
+
+    If the flat cache already exists, offsets are reconstructed from it by
+    scanning for BOS (id=2) token positions — avoids re-tokenizing from scratch.
+    Both arrays are cached separately for fast reloading on subsequent runs.
+    """
+    BOS_ID = 2
+
+    # Fast path: both caches exist
+    if (flat_cache_path and Path(flat_cache_path).exists() and
+            offsets_cache_path and Path(offsets_cache_path).exists()):
+        log.info(f"Loading cached sequences from {flat_cache_path}")
+        return np.load(flat_cache_path), np.load(offsets_cache_path)
+
+    # Medium path: flat tokens cached but offsets missing — reconstruct from BOS positions
+    if flat_cache_path and Path(flat_cache_path).exists():
+        log.info(f"Flat cache found; reconstructing sequence offsets from {flat_cache_path}")
+        flat_arr = np.load(flat_cache_path)
+        bos_pos  = np.where(flat_arr == BOS_ID)[0]
+        offsets_arr = np.append(bos_pos, len(flat_arr)).astype(np.int64)
+        if offsets_cache_path:
+            np.save(offsets_cache_path, offsets_arr)
+            log.info(f"  Offsets cached to {offsets_cache_path}")
+        log.info(f"  -> {len(offsets_arr)-1:,} sequences")
+        return flat_arr, offsets_arr
+
+    # Slow path: tokenize from scratch
+    log.info(f"Tokenizing {txt_path} ...")
+    all_tokens: list[int] = []
+    offsets: list[int] = [0]
+
+    with open(txt_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    for line in tqdm(lines, desc=Path(txt_path).name, unit="svg"):
+        line = line.strip()
+        if not line:
+            continue
+        enc = tokenizer.encode(line)   # <bos> + subword ids + <eos> via post-processor
+        all_tokens.extend(enc.ids)
+        offsets.append(len(all_tokens))
+
+    flat_arr    = np.array(all_tokens, dtype=np.uint16)
+    offsets_arr = np.array(offsets, dtype=np.int64)
+    log.info(f"  -> {len(flat_arr):,} tokens across {len(offsets_arr)-1:,} sequences")
+
+    if flat_cache_path:
+        Path(flat_cache_path).parent.mkdir(parents=True, exist_ok=True)
+        np.save(flat_cache_path, flat_arr)
+        log.info(f"  Tokens cached to {flat_cache_path}")
+    if offsets_cache_path:
+        np.save(offsets_cache_path, offsets_arr)
+        log.info(f"  Offsets cached to {offsets_cache_path}")
+
+    return flat_arr, offsets_arr
+
+
+def pad_collate(
+    batch: list[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collate variable-length (x, y) pairs into a padded batch.
+
+    x is padded with 0 (<pad>); y is padded with -1 so cross_entropy
+    (ignore_index=-1) skips those positions and pads don't contribute to loss.
+    """
+    xs, ys   = zip(*batch)
+    max_len  = max(x.size(0) for x in xs)
+    x_pad    = torch.zeros(len(xs), max_len, dtype=torch.long)
+    y_pad    = torch.full((len(ys), max_len), -1, dtype=torch.long)
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        L = x.size(0)
+        x_pad[i, :L] = x
+        y_pad[i, :L] = y
+    return x_pad, y_pad
+
+
+class SVGSequenceDataset(Dataset):
+    """
+    Per-sequence dataset: each item is one complete SVG ([BOS] … [EOS]).
+
+    filter_long=True (default): skips sequences longer than block_size+1 tokens,
+    which would be truncated and lose their closing </svg> tag. Only complete,
+    properly-closed SVGs are used for training.
+
+    Requires pad_collate as the DataLoader's collate_fn to handle the
+    variable lengths that result from different SVG sizes.
+    """
+
+    def __init__(
+        self,
+        flat_tokens: np.ndarray,
+        offsets: np.ndarray,
+        block_size: int,
+        filter_long: bool = True,
+    ):
+        self.data       = flat_tokens
+        self.offsets    = offsets        # shape (n_seqs + 1,)
+        self.block_size = block_size
+
+        lengths = np.diff(offsets)
+        if filter_long:
+            # Keep only sequences that fit entirely within block_size tokens.
+            # A sequence of length L needs L tokens for input + target shift,
+            # so we need L ≤ block_size + 1.
+            mask = lengths <= block_size + 1
+            self.valid_indices = np.where(mask)[0]
+            n_total   = len(lengths)
+            n_kept    = int(mask.sum())
+            n_dropped = n_total - n_kept
+            log.info(
+                f"SVGSequenceDataset: keeping {n_kept:,}/{n_total:,} complete sequences "
+                f"({n_kept/n_total*100:.1f}%); dropped {n_dropped:,} sequences "
+                f"longer than block_size={block_size}"
+            )
+        else:
+            self.valid_indices = np.arange(len(lengths))
+
+    def __len__(self) -> int:
+        return len(self.valid_indices)
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        real_idx = int(self.valid_indices[idx])
+        start    = int(self.offsets[real_idx])
+        end      = int(self.offsets[real_idx + 1])
+        # Truncate as a safety net (should be a no-op when filter_long=True)
+        seq = self.data[start : min(end, start + self.block_size + 1)].astype(np.int64)
+        x = torch.from_numpy(seq[:-1])
+        y = torch.from_numpy(seq[1:])
         return x, y
 
 
@@ -248,19 +392,27 @@ def train(args: argparse.Namespace) -> dict:
     # ── data ───────────────────────────────────────────────────────────────
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
 
-    def cache_path(split: str) -> Optional[str]:
+    def flat_cache(split: str) -> Optional[str]:
         if cache_dir is None:
             return None
         return str(cache_dir / f"{split}_bs{args.block_size}_tokens.npy")
 
-    train_tokens = tokenize_file(args.train_path, tokenizer, cache_path("train"))
-    val_tokens   = tokenize_file(args.val_path,   tokenizer, cache_path("val"))
+    def offsets_cache(split: str) -> Optional[str]:
+        if cache_dir is None:
+            return None
+        return str(cache_dir / f"{split}_seq_offsets.npy")
 
-    train_ds = SVGDataset(train_tokens, args.block_size)
-    val_ds   = SVGDataset(val_tokens,   args.block_size)
+    train_tokens, train_offsets = tokenize_file_to_sequences(
+        args.train_path, tokenizer, flat_cache("train"), offsets_cache("train"))
+    val_tokens, val_offsets = tokenize_file_to_sequences(
+        args.val_path, tokenizer, flat_cache("val"), offsets_cache("val"))
+
+    filter_long = not args.no_filter_long
+    train_ds = SVGSequenceDataset(train_tokens, train_offsets, args.block_size, filter_long=filter_long)
+    val_ds   = SVGSequenceDataset(val_tokens,   val_offsets,   args.block_size, filter_long=filter_long)
 
     log.info(
-        f"Dataset: train={len(train_ds):,} blocks, val={len(val_ds):,} blocks "
+        f"Dataset: train={len(train_ds):,} sequences, val={len(val_ds):,} sequences "
         f"(block_size={args.block_size})"
     )
 
@@ -269,15 +421,17 @@ def train(args: argparse.Namespace) -> dict:
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=(device_type == "cuda"),   # pin_memory unsupported on MPS
+        pin_memory=(device_type == "cuda"),
         drop_last=True,
+        collate_fn=pad_collate,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=(device_type == "cuda"),   # pin_memory unsupported on MPS
+        pin_memory=(device_type == "cuda"),
+        collate_fn=pad_collate,
     )
 
     # Limit steps if requested (useful for LR sweep to reduce compute)
@@ -286,10 +440,10 @@ def train(args: argparse.Namespace) -> dict:
         total_steps = min(args.max_steps, total_steps)
 
     warmup_steps = max(1, round(args.warmup_ratio * total_steps))
-    tokens_per_step = args.batch_size * args.block_size
+    avg_seq_len  = len(train_tokens) / max(1, len(train_ds))
     log.info(
         f"Training: {total_steps} steps | warmup={warmup_steps} | "
-        f"{tokens_per_step * total_steps / 1e6:.1f}M tokens"
+        f"{len(train_ds):,} sequences (avg {avg_seq_len:.0f} tokens each)"
     )
 
     # ── optimizer & scaler ─────────────────────────────────────────────────
@@ -526,6 +680,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Wrap model with torch.compile() (PyTorch >= 2.0, CUDA recommended)")
     p.add_argument("--save_checkpoint", action="store_true",
                    help="Save model checkpoint after training")
+    p.add_argument("--no_filter_long",  action="store_true",
+                   help="Disable filtering of sequences longer than block_size "
+                        "(by default, truncated SVGs that lose </svg> are excluded)")
 
     # LR sweep options
     p.add_argument("--lr_sweep_min", type=float, default=1e-5,
