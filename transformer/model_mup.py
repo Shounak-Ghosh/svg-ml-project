@@ -257,6 +257,82 @@ class SVGTransformerMuP(nn.Module):
 
         return idx
 
+    @torch.no_grad()
+    def generate_beam(
+        self,
+        idx: torch.Tensor,
+        beam_size: int = 5,
+        max_new_tokens: int = 1024,
+        eos_id: Optional[int] = None,
+        length_penalty: float = 0.6,
+    ) -> torch.Tensor:
+        """
+        Beam search decoding — significantly better than sampling for structured
+        outputs like SVG XML because it explores multiple completion paths and
+        returns the globally highest-likelihood sequence.
+
+        length_penalty: score / (gen_len ** alpha). alpha=0 → no normalization,
+                        alpha=1 → full length normalization. 0.6 is a common default.
+        Returns a (1, T') tensor for the single best beam.
+        """
+        device = idx.device
+        T0     = idx.size(1)   # seed length
+
+        beams: list[tuple[float, torch.Tensor]] = [(0.0, idx.clone())]
+        completed: list[tuple[float, torch.Tensor]] = []
+
+        for _ in range(max_new_tokens):
+            if not beams:
+                break
+
+            # Forward pass for all active beams in one batched call
+            seqs      = torch.cat([b[1] for b in beams], dim=0)    # (n, T)
+            idx_cond  = seqs[:, -self.config.block_size:]
+            logits, _ = self(idx_cond)                              # (n, 1, V)
+            log_probs = F.log_softmax(logits[:, -1, :], dim=-1)     # (n, V)
+
+            V      = log_probs.size(-1)
+            scores = torch.tensor([b[0] for b in beams], device=device)  # (n,)
+            # candidate log-probs: (n, V)
+            candidates  = scores.unsqueeze(1) + log_probs
+
+            # Pick global top beam_size candidates
+            flat       = candidates.view(-1)
+            k          = min(beam_size, flat.size(0))
+            top_scores, top_idx = torch.topk(flat, k=k)
+
+            new_beams: list[tuple[float, torch.Tensor]] = []
+            for score, flat_i in zip(top_scores.tolist(), top_idx.tolist()):
+                bi  = flat_i // V
+                tok = flat_i  % V
+                new_seq = torch.cat(
+                    [beams[bi][1], torch.tensor([[tok]], device=device)], dim=1
+                )
+                gen_len = new_seq.size(1) - T0
+
+                if eos_id is not None and tok == eos_id:
+                    norm = gen_len ** length_penalty if gen_len > 0 else 1.0
+                    completed.append((score / norm, new_seq))
+                else:
+                    new_beams.append((score, new_seq))
+
+            beams = new_beams[:beam_size]
+
+            if len(completed) >= beam_size:
+                break
+
+        if completed:
+            return max(completed, key=lambda x: x[0])[1]
+
+        if not beams:
+            return idx   # nothing generated — return seed
+
+        def _norm(b: tuple[float, torch.Tensor]) -> float:
+            gen_len = max(1, b[1].size(1) - T0)
+            return b[0] / (gen_len ** length_penalty)
+
+        return max(beams, key=_norm)[1]
+
     def configure_optimizers_mup(
         self,
         weight_decay: float,

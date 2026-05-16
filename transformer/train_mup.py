@@ -173,16 +173,18 @@ def train_mup(args: argparse.Namespace) -> dict:
         collate_fn=pad_collate,
     )
 
-    steps_per_epoch = len(train_loader)
-    total_steps     = args.n_epochs * steps_per_epoch
+    # Each optimizer step consumes grad_accumulation micro-batches
+    ga                  = max(1, args.grad_accumulation)
+    steps_per_epoch     = len(train_loader) // ga   # full optimizer steps per epoch
+    total_steps         = args.n_epochs * steps_per_epoch
     if args.max_steps is not None:
         total_steps = min(args.max_steps, total_steps)
 
     warmup_steps = max(1, round(args.warmup_ratio * total_steps))
     avg_seq_len  = len(train_tokens) / max(1, len(train_ds))
     log.info(
-        f"Training: {args.n_epochs} epoch(s) × {steps_per_epoch} steps = "
-        f"{total_steps} total steps | warmup={warmup_steps} | "
+        f"Training: {args.n_epochs} epoch(s) × {steps_per_epoch} optimizer steps "
+        f"(grad_accumulation={ga}) = {total_steps} total steps | warmup={warmup_steps} | "
         f"{len(train_ds):,} sequences (avg {avg_seq_len:.0f} tokens each)"
     )
 
@@ -212,10 +214,13 @@ def train_mup(args: argparse.Namespace) -> dict:
     }
 
     model.train()
-    t0          = time.perf_counter()
-    tokens_seen = 0
-    log_every   = max(1, total_steps // 200)
-    step        = 0
+    t0            = time.perf_counter()
+    tokens_seen   = 0
+    log_every     = max(1, total_steps // 200)
+    step          = 0      # optimizer steps (each covers ga micro-batches)
+    micro_step    = 0      # raw DataLoader batches seen
+    running_loss  = 0.0    # accumulates scaled loss across micro-batches
+    optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(args.n_epochs):
         train_iter = iter(train_loader)
@@ -225,35 +230,42 @@ def train_mup(args: argparse.Namespace) -> dict:
 
             x, y = x.to(device), y.to(device)
 
-            # Cosine LR schedule — preserve per-group width_mult ratios
-            # initial_lrs[i] = args.lr / width_mult_i  (set by MuAdamW at creation)
-            # g['lr'] = initial_lrs[i] * (lr_t / args.lr) = lr_t / width_mult_i
-            lr_t = get_lr(step, warmup_steps, total_steps, args.lr, args.lr * args.lr_decay_ratio)
-            for g, init_lr in zip(optimizer.param_groups, initial_lrs):
-                g["lr"] = init_lr * (lr_t / args.lr)
-
+            # ── forward + scaled backward ──────────────────────────────────
             with ctx:
                 _, loss = model(x, y)
 
-            loss.backward()
-            if args.grad_clip > 0.0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            # Divide loss so that the sum over ga micro-batches == a single full-batch loss
+            (loss / ga).backward()
+            running_loss  += loss.item() / ga
+            tokens_seen   += x.numel()
+            micro_step    += 1
 
-            tokens_seen += x.numel()
-            step        += 1
+            # ── optimizer step every ga micro-batches ──────────────────────
+            if micro_step % ga == 0:
+                # Cosine LR — preserve per-group width multiplier ratios
+                lr_t = get_lr(step, warmup_steps, total_steps, args.lr, args.lr * args.lr_decay_ratio)
+                for g, init_lr in zip(optimizer.param_groups, initial_lrs):
+                    g["lr"] = init_lr * (lr_t / args.lr)
 
-            if step % log_every == 0 or step == total_steps:
-                elapsed = time.perf_counter() - t0
-                tps = tokens_seen / elapsed if elapsed > 0 else 0.0
-                results["train_losses"].append(
-                    {"step": step, "epoch": epoch, "loss": round(loss.item(), 5), "lr": lr_t}
-                )
-                log.info(
-                    f"  epoch {epoch+1}/{args.n_epochs} step {step:5d}/{total_steps} | "
-                    f"loss {loss.item():.4f} | lr {lr_t:.2e} | {tps:,.0f} tok/s"
-                )
+                if args.grad_clip > 0.0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+
+                step += 1
+
+                if step % log_every == 0 or step == total_steps:
+                    elapsed = time.perf_counter() - t0
+                    tps = tokens_seen / elapsed if elapsed > 0 else 0.0
+                    results["train_losses"].append(
+                        {"step": step, "epoch": epoch, "loss": round(running_loss, 5), "lr": lr_t}
+                    )
+                    log.info(
+                        f"  epoch {epoch+1}/{args.n_epochs} step {step:5d}/{total_steps} | "
+                        f"loss {running_loss:.4f} | lr {lr_t:.2e} | {tps:,.0f} tok/s"
+                    )
+
+                running_loss = 0.0
 
         if step >= total_steps:
             break
@@ -409,6 +421,9 @@ def parse_args_mup(argv=None) -> argparse.Namespace:
     p.add_argument("--save_checkpoint", action="store_true")
     p.add_argument("--no_filter_long",  action="store_true",
                    help="Disable filtering of sequences longer than block_size")
+    p.add_argument("--grad_accum",      type=int, default=1,
+                   help="Gradient accumulation steps. Effective batch = batch_size x grad_accum. "
+                        "Helps stabilize training with variable-length per-sequence batches.")
 
     # LR sweep options
     p.add_argument("--lr_sweep_min", type=float, default=1e-5)

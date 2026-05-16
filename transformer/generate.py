@@ -126,6 +126,7 @@ def generate_unconditional(
     top_p: float = 0.9,
     greedy: bool = False,
     prime_eos: bool = False,
+    beam_size: int = 1,
 ) -> list:
     """
     Generate n_samples unconditional SVGs starting from <bos>.
@@ -149,14 +150,23 @@ def generate_unconditional(
         seed = torch.tensor([seed_ids], dtype=torch.long, device=device)
 
         t0 = time.perf_counter()
-        generated = model.generate(
-            seed,
-            max_new_tokens=max_new_tokens,
-            temperature=temp,
-            top_k=(1 if greedy else top_k),
-            top_p=(None if greedy else top_p),
-            eos_id=EOS_ID,
-        )
+        use_beam = beam_size > 1 and hasattr(model, "generate_beam")
+        if use_beam:
+            generated = model.generate_beam(
+                seed,
+                beam_size=beam_size,
+                max_new_tokens=max_new_tokens,
+                eos_id=EOS_ID,
+            )
+        else:
+            generated = model.generate(
+                seed,
+                max_new_tokens=max_new_tokens,
+                temperature=temp,
+                top_k=(1 if greedy else top_k),
+                top_p=(None if greedy else top_p),
+                eos_id=EOS_ID,
+            )
         elapsed = time.perf_counter() - t0
 
         token_ids   = generated[0].tolist()
@@ -166,13 +176,13 @@ def generate_unconditional(
         results.append({
             "name":             f"unconditional_{i:02d}",
             "svg":              svg_text,
-            "temperature":      0.0 if greedy else temp,
-            "top_k":            1 if greedy else top_k,
-            "top_p":            0.0 if greedy else top_p,
+            "temperature":      0.0 if (greedy or use_beam) else temp,
+            "top_k":            beam_size if use_beam else (1 if greedy else top_k),
+            "top_p":            0.0 if (greedy or use_beam) else top_p,
             "tokens_generated": n_generated,
             "elapsed_s":        round(elapsed, 2),
         })
-        mode = "greedy" if greedy else f"temp={temp}"
+        mode = f"beam={beam_size}" if use_beam else ("greedy" if greedy else f"temp={temp}")
         log.info(f"  [{i+1:02d}/{n_samples}] {mode} | {n_generated} tokens | {elapsed:.1f}s")
 
     return results
@@ -189,6 +199,7 @@ def generate_from_prefix(
     top_k: int = 50,
     top_p: float = 0.9,
     greedy: bool = False,
+    beam_size: int = 1,
 ) -> dict:
     """Complete an SVG from a given prefix string."""
     prefix_ids = encode_no_special(prefix_text, tokenizer)
@@ -198,14 +209,23 @@ def generate_from_prefix(
     log.info(f"  '{prefix_name}': {len(prefix_ids)} prefix tokens")
 
     t0 = time.perf_counter()
-    generated = model.generate(
-        seed,
-        max_new_tokens=max_new_tokens,
-        temperature=1.0 if greedy else temperature,
-        top_k=1 if greedy else top_k,
-        top_p=None if greedy else top_p,
-        eos_id=EOS_ID,
-    )
+    use_beam = beam_size > 1 and hasattr(model, "generate_beam")
+    if use_beam:
+        generated = model.generate_beam(
+            seed,
+            beam_size=beam_size,
+            max_new_tokens=max_new_tokens,
+            eos_id=EOS_ID,
+        )
+    else:
+        generated = model.generate(
+            seed,
+            max_new_tokens=max_new_tokens,
+            temperature=1.0 if greedy else temperature,
+            top_k=1 if greedy else top_k,
+            top_p=None if greedy else top_p,
+            eos_id=EOS_ID,
+        )
     elapsed = time.perf_counter() - t0
 
     token_ids   = generated[0].tolist()
@@ -218,9 +238,9 @@ def generate_from_prefix(
         "name":             f"prefix_{prefix_name}",
         "prefix_text":      prefix_text,
         "svg":              svg_text,
-        "temperature":      0.0 if greedy else temperature,
-        "top_k":            1 if greedy else top_k,
-        "top_p":            0.0 if greedy else top_p,
+        "temperature":      0.0 if (greedy or use_beam) else temperature,
+        "top_k":            beam_size if use_beam else (1 if greedy else top_k),
+        "top_p":            0.0 if (greedy or use_beam) else top_p,
         "prefix_tokens":    len(prefix_ids),
         "tokens_generated": n_generated,
         "elapsed_s":        round(elapsed, 2),
@@ -304,6 +324,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Temperature for prefix-conditioned generation")
     p.add_argument("--top_k", type=int, default=50)
     p.add_argument("--top_p", type=float, default=0.9)
+    p.add_argument("--beam_size", type=int, default=1,
+                   help="Beam search width (1 = disabled, use sampling/greedy). "
+                        "Only supported for muP models with generate_beam().")
     return p.parse_args(argv)
 
 
@@ -336,6 +359,7 @@ def main() -> None:
         top_p=args.top_p,
         greedy=args.greedy,
         prime_eos=args.prime_eos,
+        beam_size=args.beam_size,
     )
     all_results.extend(unconditional)
 
@@ -351,6 +375,7 @@ def main() -> None:
             top_k=args.top_k,
             top_p=args.top_p,
             greedy=args.greedy,
+            beam_size=args.beam_size,
         )
         all_results.append(result)
 

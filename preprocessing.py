@@ -388,6 +388,17 @@ def main() -> None:
         help="Skip starvector/svg-emoji-simple dataset"
     )
     parser.add_argument(
+        "--no-fonts", action="store_true",
+        help="Skip starvector/svg-fonts-simple dataset"
+    )
+    parser.add_argument(
+        "--max-fonts", type=int, default=None,
+        metavar="N",
+        help="Randomly subsample at most N SVGs from svg-fonts-simple (default: use all). "
+             "The dataset has grown to ~1.8M SVGs on HuggingFace; use ~270000 to match "
+             "the scale of the reference implementation."
+    )
+    parser.add_argument(
         "--no-svgen", action="store_true",
         help="Skip umuthopeyildirim/svgen-500k dataset"
     )
@@ -414,6 +425,14 @@ def main() -> None:
     if not args.no_emoji:
         emoji_svgs = load_svgs_from_hf("starvector/svg-emoji-simple")
         all_svgs.extend(emoji_svgs)
+
+    if not args.no_fonts:
+        fonts_svgs = load_svgs_from_hf("starvector/svg-fonts-simple")
+        if args.max_fonts is not None and len(fonts_svgs) > args.max_fonts:
+            rng = random.Random(args.seed)
+            fonts_svgs = rng.sample(fonts_svgs, args.max_fonts)
+            print(f"  Subsampled svg-fonts-simple to {args.max_fonts:,} SVGs")
+        all_svgs.extend(fonts_svgs)
 
     if not args.no_svgen:
         svgen_svgs = load_svgs_from_hf("umuthopeyildirim/svgen-500k")
