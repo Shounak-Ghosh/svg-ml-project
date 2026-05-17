@@ -277,6 +277,33 @@ def train_mup(args: argparse.Namespace) -> dict:
         if step >= total_steps:
             break
 
+        # Discard any partial accumulation window that crossed the epoch boundary
+        # so epoch N+1 doesn't carry stale gradients from the tail of epoch N.
+        if micro_step % ga != 0:
+            optimizer.zero_grad(set_to_none=True)
+            running_loss = 0.0
+
+        # Save a per-epoch checkpoint so later epochs can't destroy earlier good weights.
+        if args.save_checkpoint and args.n_epochs > 1:
+            ep_val_loss = evaluate(model, val_loader, device, ctx)
+            log.info(f"  End of epoch {epoch+1}: val_loss={ep_val_loss:.4f}")
+            try:
+                ep_state = model._orig_mod.state_dict()   # type: ignore[union-attr]
+            except AttributeError:
+                ep_state = model.state_dict()
+            ep_tag  = f"{args.model_size}_lr{args.lr:.0e}_ep{epoch+1}of{args.n_epochs}_mup"
+            ep_path = mup_out_dir / f"{ep_tag}_ckpt.pt"
+            torch.save({
+                "model_state_dict": ep_state,
+                "config":           cfg.__dict__,
+                "val_loss":         ep_val_loss,
+                "n_params":         n_params,
+                "args":             vars(args),
+                "base_shapes_path": str(base_shapes_path),
+            }, ep_path)
+            log.info(f"  Per-epoch checkpoint -> {ep_path}")
+            model.train()
+
         # Clear MPS cache between epochs to avoid fragmentation/accumulation
         if device_type == "mps":
             torch.mps.empty_cache()
