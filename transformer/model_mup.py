@@ -271,8 +271,8 @@ class SVGTransformerMuP(nn.Module):
         outputs like SVG XML because it explores multiple completion paths and
         returns the globally highest-likelihood sequence.
 
-        length_penalty: score / (gen_len ** alpha). alpha=0 → no normalization,
-                        alpha=1 → full length normalization. 0.6 is a common default.
+        length_penalty: score / (gen_len ** alpha). alpha=0 --> no normalization,
+                        alpha=1 --> full length normalization. 0.6 is a common default.
         Returns a (1, T') tensor for the single best beam.
         """
         device = idx.device
@@ -319,17 +319,35 @@ class SVGTransformerMuP(nn.Module):
             beams = new_beams[:beam_size]
 
             if len(completed) >= beam_size:
-                break
+                # Only stop early if no active beam can beat the best completed beam.
+                # Use the current (unnormalized) active score as an upper bound: since
+                # every future log-prob ≤ 0, the normalized score can only decrease.
+                best_completed = max(c[0] for c in completed)
+                if not beams:
+                    break
+                best_active_norm = max(
+                    b[0] / max(1, b[1].size(1) - T0) ** length_penalty
+                    for b in beams
+                )
+                if best_active_norm <= best_completed:
+                    break
+
+        def _norm(b: tuple[float, torch.Tensor]) -> float:
+            gen_len = max(1, b[1].size(1) - T0)
+            return b[0] / (gen_len ** length_penalty)
+
+        if completed and beams:
+            best_completed = max(completed, key=lambda x: x[0])
+            best_active    = max(beams, key=_norm)
+            if best_completed[0] >= _norm(best_active):
+                return best_completed[1]
+            return best_active[1]
 
         if completed:
             return max(completed, key=lambda x: x[0])[1]
 
         if not beams:
             return idx   # nothing generated — return seed
-
-        def _norm(b: tuple[float, torch.Tensor]) -> float:
-            gen_len = max(1, b[1].size(1) - T0)
-            return b[0] / (gen_len ** length_penalty)
 
         return max(beams, key=_norm)[1]
 

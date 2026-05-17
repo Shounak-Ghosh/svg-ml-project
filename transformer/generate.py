@@ -10,6 +10,7 @@ Usage:
         --out_dir transformer/runs/generated/small_test/
 """
 
+import re
 import sys
 import os
 import json
@@ -36,33 +37,36 @@ log = logging.getLogger(__name__)
 BOS_ID = 2
 EOS_ID = 3
 
-# 5 interesting SVG prefixes for conditioned generation
+# 5 interesting SVG prefixes for conditioned generation.
+# All include xmlns so the prefix matches the training data distribution
+# (every training SVG starts with <svg xmlns="http://www.w3.org/2000/svg" ...>).
+_NS = 'xmlns="http://www.w3.org/2000/svg"'
 PREFIXES = [
     (
         "face_partial",
-        '<svg viewBox="0 0 100 100">'
+        f'<svg {_NS} viewBox="0 0 100 100">'
         '<circle cx="50" cy="50" r="40"/>'
         '<circle cx="35" cy="45" r="5" fill="black"/>',
     ),
     (
         "open_path",
-        '<svg viewBox="0 0 100 100">'
+        f'<svg {_NS} viewBox="0 0 100 100">'
         '<path d="M 10 50 C 20 20,',
     ),
     (
         "group_rect",
-        '<svg viewBox="0 0 100 100">'
+        f'<svg {_NS} viewBox="0 0 100 100">'
         '<g><rect x="20" y="20" width="60" height="60" fill="blue"/>',
     ),
     (
         "partial_polygon",
-        '<svg viewBox="0 0 100 100">'
+        f'<svg {_NS} viewBox="0 0 100 100">'
         '<polygon points="50,10 61,35',
     ),
     (
-        "text_element",
-        '<svg viewBox="0 0 200 100">'
-        '<text x="10" y="40">Hello',
+        "icon_path",
+        f'<svg {_NS} viewBox="0 0 24 24">'
+        '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2z',
     ),
 ]
 
@@ -115,6 +119,9 @@ def decode_tokens(ids: list, tokenizer: Tokenizer) -> str:
     return tokenizer.decode(clean_ids)
 
 
+SVG_SEED_TEXT = '<svg xmlns="http://www.w3.org/2000/svg"'
+
+
 def generate_unconditional(
     model,
     tokenizer: Tokenizer,
@@ -127,22 +134,29 @@ def generate_unconditional(
     greedy: bool = False,
     prime_eos: bool = False,
     beam_size: int = 1,
+    use_svg_seed: bool = True,
 ) -> list:
     """
-    Generate n_samples unconditional SVGs starting from <bos>.
+    Generate n_samples unconditional SVGs.
 
-    Distributes samples evenly across the given temperatures.
-
-    prime_eos: prepend EOS before BOS so the model sees the EOS→BOS transition
-               it was trained on (packed-sequence datasets almost always have
-               a preceding EOS before each BOS in training chunks).
+    use_svg_seed: if True (default), seed with the canonical SVG namespace prefix
+                  so the model starts from a known token context rather than bare BOS.
+                  Disable with --no_svg_seed to revert to [BOS]-only seeding.
+    prime_eos: prepend EOS before BOS (only relevant when use_svg_seed=False; for
+               packed-sequence checkpoints that need the EOS-->BOS context).
     greedy: if True, ignore temperatures and always pick the argmax token.
     """
     if temperatures is None:
         temperatures = [0.5, 0.8, 1.0]
 
-    seed_ids = [EOS_ID, BOS_ID] if prime_eos else [BOS_ID]
-    n_seed   = len(seed_ids)
+    if use_svg_seed:
+        svg_ids = tokenizer.encode(SVG_SEED_TEXT, add_special_tokens=False).ids
+        seed_ids = [BOS_ID] + svg_ids
+    elif prime_eos:
+        seed_ids = [EOS_ID, BOS_ID]
+    else:
+        seed_ids = [BOS_ID]
+    n_seed = len(seed_ids)
 
     results = []
     for i in range(n_samples):
@@ -277,11 +291,21 @@ def render_svg(svg_path: Path) -> bool:
     if _try_render(svg_text):
         return True
 
-    # Recovery: if the SVG is truncated (no closing tag), append </svg> and retry
+    # Recovery 1: missing </svg> — just append it
     if "</svg>" not in svg_text.lower():
         if _try_render(svg_text + "</svg>"):
             svg_path.write_text(svg_text + "</svg>", encoding="utf-8")
             log.info(f"  Recovered {svg_path.name} by appending </svg>")
+            return True
+
+    # Recovery 2: truncated mid-element (unclosed tag or attribute value).
+    # Strip everything from the last incomplete '<' onward, then close the svg.
+    cleaned = re.sub(r'<[^>]*$', '', svg_text).strip()
+    if cleaned and cleaned != svg_text:
+        candidate = cleaned if cleaned.rstrip().endswith("</svg>") else cleaned + "</svg>"
+        if _try_render(candidate):
+            svg_path.write_text(candidate, encoding="utf-8")
+            log.info(f"  Recovered {svg_path.name} by truncating partial element")
             return True
 
     # Log the underlying error from the original attempt
@@ -316,7 +340,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Greedy decoding (argmax at each step); overrides temperature/top_k/top_p")
     p.add_argument("--prime_eos", action="store_true",
                    help="Seed unconditional generation with [EOS, BOS] instead of [BOS]. "
-                        "Matches the EOS→BOS transition seen in packed-sequence training.")
+                        "Matches the EOS-->BOS transition seen in packed-sequence training.")
     p.add_argument("--temperatures", type=float, nargs="+", default=[0.5, 0.8, 1.0],
                    metavar="T",
                    help="Temperatures cycled across unconditional samples")
@@ -327,6 +351,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--beam_size", type=int, default=1,
                    help="Beam search width (1 = disabled, use sampling/greedy). "
                         "Only supported for muP models with generate_beam().")
+    p.add_argument("--no_svg_seed", action="store_true",
+                   help="Seed unconditional generation with bare [BOS] instead of "
+                        "[BOS + <svg xmlns=...>]. Use for models that cleanly start from BOS.")
     return p.parse_args(argv)
 
 
@@ -360,6 +387,7 @@ def main() -> None:
         greedy=args.greedy,
         prime_eos=args.prime_eos,
         beam_size=args.beam_size,
+        use_svg_seed=not args.no_svg_seed,
     )
     all_results.extend(unconditional)
 

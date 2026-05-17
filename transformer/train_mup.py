@@ -161,6 +161,7 @@ def train_mup(args: argparse.Namespace) -> dict:
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=(device_type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         drop_last=True,
         collate_fn=pad_collate,
     )
@@ -170,11 +171,12 @@ def train_mup(args: argparse.Namespace) -> dict:
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=(device_type == "cuda"),
+        persistent_workers=(args.num_workers > 0),
         collate_fn=pad_collate,
     )
 
-    # Each optimizer step consumes grad_accumulation micro-batches
-    ga                  = max(1, args.grad_accumulation)
+    # Each optimizer step consumes grad_accum micro-batches
+    ga                  = max(1, args.grad_accum)
     steps_per_epoch     = len(train_loader) // ga   # full optimizer steps per epoch
     total_steps         = args.n_epochs * steps_per_epoch
     if args.max_steps is not None:
@@ -184,7 +186,7 @@ def train_mup(args: argparse.Namespace) -> dict:
     avg_seq_len  = len(train_tokens) / max(1, len(train_ds))
     log.info(
         f"Training: {args.n_epochs} epoch(s) × {steps_per_epoch} optimizer steps "
-        f"(grad_accumulation={ga}) = {total_steps} total steps | warmup={warmup_steps} | "
+        f"(grad_accum={ga}) = {total_steps} total steps | warmup={warmup_steps} | "
         f"{len(train_ds):,} sequences (avg {avg_seq_len:.0f} tokens each)"
     )
 
@@ -197,7 +199,10 @@ def train_mup(args: argparse.Namespace) -> dict:
         lr=args.lr,
         betas=(0.9, 0.95),
     )
-    # No GradScaler — float32 only on MPS; CUDA path keeps same simplicity here
+    # GradScaler: only needed for CUDA + float16 (not bfloat16, not MPS).
+    # Enabling it on float16 prevents gradient underflow; bfloat16 doesn't need it.
+    _scaler_device = "cuda" if device_type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(_scaler_device, enabled=(device_type == "cuda" and dtype == torch.float16))
 
     # ── training loop ──────────────────────────────────────────────────────
     results: dict = {
@@ -235,7 +240,7 @@ def train_mup(args: argparse.Namespace) -> dict:
                 _, loss = model(x, y)
 
             # Divide loss so that the sum over ga micro-batches == a single full-batch loss
-            (loss / ga).backward()
+            scaler.scale(loss / ga).backward()
             running_loss  += loss.item() / ga
             tokens_seen   += x.numel()
             micro_step    += 1
@@ -248,8 +253,10 @@ def train_mup(args: argparse.Namespace) -> dict:
                     g["lr"] = init_lr * (lr_t / args.lr)
 
                 if args.grad_clip > 0.0:
+                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
                 step += 1
@@ -269,6 +276,10 @@ def train_mup(args: argparse.Namespace) -> dict:
 
         if step >= total_steps:
             break
+
+        # Clear MPS cache between epochs to avoid fragmentation/accumulation
+        if device_type == "mps":
+            torch.mps.empty_cache()
 
     # ── end-of-epoch metrics ───────────────────────────────────────────────
     wall_clock = time.perf_counter() - t0
