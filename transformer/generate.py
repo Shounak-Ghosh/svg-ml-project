@@ -273,6 +273,13 @@ def render_svg(svg_path: Path) -> bool:
                 _brew_lib + ":" + os.environ.get("DYLD_LIBRARY_PATH", "")
             ).rstrip(":")
         
+        # On Windows, cairocffi needs libcairo-2.dll from the GTK3 runtime.
+        # Add the GTK bin dir to PATH before the import so ctypes can find it
+        # even if the terminal session predates the PATH change.
+        _gtk_bin = r"C:\Program Files\GTK3-Runtime Win64\bin"
+        if os.path.isdir(_gtk_bin) and _gtk_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _gtk_bin + os.pathsep + os.environ.get("PATH", "")
+        
         import cairosvg  # lazy import — optional dependency
     except ImportError:
         log.warning("cairosvg not installed; skipping render. Run: pip install cairosvg")
