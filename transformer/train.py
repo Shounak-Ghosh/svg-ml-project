@@ -24,11 +24,11 @@ Usage examples
   python transformer/train.py --mode lr_sweep --max_steps 3000
 
 # Train a single model size for 1 full epoch:
-  python transformer/train.py --model_size tiny  --lr 3e-4 --save_checkpoint
-  python transformer/train.py --model_size small --lr 3e-4 --save_checkpoint
-  python transformer/train.py --model_size medium --lr 3e-4 --save_checkpoint
-  python transformer/train.py --model_size large  --lr 3e-4 --save_checkpoint
-  python transformer/train.py --model_size xl     --lr 3e-4 --save_checkpoint
+  python transformer/train.py --model_size tiny  --lr 1e-2 --save_checkpoint
+  python transformer/train.py --model_size small --lr 1e-2 --save_checkpoint
+  python transformer/train.py --model_size medium --lr 1e-2 --save_checkpoint
+  python transformer/train.py --model_size large  --lr 1e-2 --save_checkpoint
+  python transformer/train.py --model_size xl     --lr 1e-2 --save_checkpoint
 """
 
 import sys
