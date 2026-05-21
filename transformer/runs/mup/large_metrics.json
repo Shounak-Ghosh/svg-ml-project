@@ -1,0 +1,26 @@
+{
+  "ckpt": "transformer/runs/mup/large_lr1e-02_2ep_mup_ckpt.pt",
+  "metrics": {
+    "perplexity": {
+      "perplexity": 4.8605,
+      "avg_loss": 1.581137,
+      "n_seqs": 3064,
+      "n_tokens": 2560736
+    },
+    "xml_validity": {
+      "xml_valid": 18,
+      "xml_total": 50,
+      "xml_valid_rate": 0.36
+    },
+    "render_rate": {
+      "render_valid": 18,
+      "render_total": 50,
+      "render_rate": 0.36
+    },
+    "structural_validity": {
+      "struct_valid": 18,
+      "struct_total": 50,
+      "struct_valid_rate": 0.36
+    }
+  }
+}

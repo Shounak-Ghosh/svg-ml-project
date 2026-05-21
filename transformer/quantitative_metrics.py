@@ -343,7 +343,7 @@ def main() -> None:
     out_path = Path(args.out) if args.out else Path(args.ckpt).parent / "metrics.json"
     with open(out_path, "w") as f:
         json.dump({"ckpt": args.ckpt, "metrics": results}, f, indent=2)
-    log.info(f"\nResults saved → {out_path}")
+    log.info(f"\nResults saved --> {out_path}")
 
     # ── Summary ───────────────────────────────────────────────────────────────
     print(f"\n{'═'*58}")
