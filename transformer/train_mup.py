@@ -20,6 +20,8 @@ Usage
   python transformer/train_mup.py --model_size xl     --lr <best_lr> --save_checkpoint
 """
 
+import copy
+import math
 import sys
 import time
 import json
@@ -117,12 +119,17 @@ def train_mup(args: argparse.Namespace) -> dict:
     n_params = model.count_parameters()
     log.info(f"muP model '{args.model_size}': {n_params:,} parameters")
 
+    resume_step = 0
     if args.resume_ckpt:
         log.info(f"Resuming weights from: {args.resume_ckpt}")
         resume_data = torch.load(args.resume_ckpt, map_location="cpu", weights_only=False)
         raw_for_load = model._orig_mod if hasattr(model, "_orig_mod") else model
         raw_for_load.load_state_dict(resume_data["model_state_dict"])
-        log.info(f"  Resumed from val_loss={resume_data.get('val_loss', 'unknown')}")
+        resume_step = resume_data.get("step", 0)
+        log.info(
+            f"  Resumed from val_loss={resume_data.get('val_loss', 'unknown')}, "
+            f"step={resume_step}"
+        )
 
     if args.compile and hasattr(torch, "compile"):
         log.info("Compiling model with torch.compile() ...")
@@ -146,7 +153,7 @@ def train_mup(args: argparse.Namespace) -> dict:
     val_tokens, val_offsets = tokenize_file_to_sequences(
         args.val_path, tokenizer, flat_cache("val"), offsets_cache("val"))
 
-    filter_long = not args.no_filter_long
+    filter_long = args.filter_long
     train_ds = SVGSequenceDataset(train_tokens, train_offsets, args.block_size, filter_long=filter_long)
     val_ds   = SVGSequenceDataset(val_tokens,   val_offsets,   args.block_size, filter_long=filter_long)
 
@@ -181,6 +188,9 @@ def train_mup(args: argparse.Namespace) -> dict:
     total_steps         = args.n_epochs * steps_per_epoch
     if args.max_steps is not None:
         total_steps = min(args.max_steps, total_steps)
+    # Offset the schedule by already-trained steps so the cosine curve continues
+    # from where it left off rather than restarting from the peak LR.
+    total_steps += resume_step
 
     warmup_steps = max(1, round(args.warmup_ratio * total_steps))
     avg_seq_len  = len(train_tokens) / max(1, len(train_ds))
@@ -211,6 +221,7 @@ def train_mup(args: argparse.Namespace) -> dict:
         "lr":             args.lr,
         "n_epochs":       args.n_epochs,
         "resumed_from":   args.resume_ckpt,
+        "diverged":       False,
         "train_losses":   [],
         "val_loss":       None,
         "wall_clock_s":   None,
@@ -222,9 +233,9 @@ def train_mup(args: argparse.Namespace) -> dict:
     t0            = time.perf_counter()
     tokens_seen   = 0
     log_every     = max(1, total_steps // 200)
-    step          = 0      # optimizer steps (each covers ga micro-batches)
-    micro_step    = 0      # raw DataLoader batches seen
-    running_loss  = 0.0    # accumulates scaled loss across micro-batches
+    step          = resume_step   # continue from checkpoint step, not from 0
+    micro_step    = 0             # raw DataLoader batches seen this session
+    running_loss  = 0.0           # accumulates scaled loss across micro-batches
     optimizer.zero_grad(set_to_none=True)
 
     for epoch in range(args.n_epochs):
@@ -238,6 +249,12 @@ def train_mup(args: argparse.Namespace) -> dict:
             # ── forward + scaled backward ──────────────────────────────────
             with ctx:
                 _, loss = model(x, y)
+
+            if not math.isfinite(loss.item()):
+                log.warning(f"Training diverged (loss={loss.item()}) at step {step}; aborting run.")
+                results["diverged"] = True
+                results["val_loss"] = float("nan")
+                return results
 
             # Divide loss so that the sum over ga micro-batches == a single full-batch loss
             scaler.scale(loss / ga).backward()
@@ -300,6 +317,8 @@ def train_mup(args: argparse.Namespace) -> dict:
                 "n_params":         n_params,
                 "args":             vars(args),
                 "base_shapes_path": str(base_shapes_path),
+                "step":             step,
+                "total_steps":      total_steps,
             }, ep_path)
             log.info(f"  Per-epoch checkpoint -> {ep_path}")
             model.train()
@@ -355,6 +374,8 @@ def train_mup(args: argparse.Namespace) -> dict:
             "n_params":         n_params,
             "args":             vars(args),
             "base_shapes_path": str(base_shapes_path),
+            "step":             step,
+            "total_steps":      total_steps,
         }
         ckpt_path = mup_out_dir / f"{run_tag}_ckpt.pt"
         torch.save(ckpt, ckpt_path)
@@ -373,6 +394,7 @@ def run_mup_lr_sweep(args: argparse.Namespace) -> float:
 
     The best LR found here should transfer zero-shot to all larger model sizes
     under muP (that is the key claim of the muP paper).
+    Diverged runs (NaN/inf loss) are skipped when selecting the best LR.
     """
     lrs: list[float] = np.logspace(
         np.log10(args.lr_sweep_min),
@@ -382,16 +404,24 @@ def run_mup_lr_sweep(args: argparse.Namespace) -> float:
 
     log.info(f"muP LR sweep on 'tiny' over {args.n_lrs} values: {[f'{lr:.2e}' for lr in lrs]}")
 
-    args.model_size = "tiny"
+    args_copy = copy.copy(args)
+    args_copy.model_size = "tiny"
     sweep_results: list[dict] = []
 
     for lr in lrs:
         log.info(f"\n{'=' * 60}\nSweeping LR = {lr:.2e}\n{'=' * 60}")
-        args.lr = lr
-        result  = train_mup(args)
-        entry   = {"lr": lr, "val_loss": result["val_loss"]}
+        args_copy.lr = lr
+        result  = train_mup(args_copy)
+        entry   = {
+            "lr":       lr,
+            "val_loss": result["val_loss"],
+            "diverged": result.get("diverged", False),
+        }
         sweep_results.append(entry)
-        log.info(f"  LR {lr:.2e}  ->  val_loss {result['val_loss']:.4f}")
+        if result.get("diverged"):
+            log.info(f"  LR {lr:.2e}  -> DIVERGED (skipping)")
+        else:
+            log.info(f"  LR {lr:.2e}  ->  val_loss {result['val_loss']:.4f}")
 
     mup_out_dir = Path(args.out_dir) / "mup"
     mup_out_dir.mkdir(parents=True, exist_ok=True)
@@ -400,7 +430,11 @@ def run_mup_lr_sweep(args: argparse.Namespace) -> float:
         json.dump({"sweep": sweep_results}, f, indent=2)
     log.info(f"muP LR sweep results -> {sweep_path}")
 
-    best = min(sweep_results, key=lambda r: r["val_loss"])
+    valid = [r for r in sweep_results if not r.get("diverged")]
+    if not valid:
+        log.warning("All muP LR values diverged — returning smallest LR as fallback.")
+        return float(lrs[0])
+    best = min(valid, key=lambda r: r["val_loss"])
     log.info(
         f"\nBest muP LR: {best['lr']:.2e}  (val_loss={best['val_loss']:.4f})\n"
         f"Use:  --lr {best['lr']:.2e}  for all model sizes (muP transfers zero-shot)."
@@ -457,16 +491,17 @@ def parse_args_mup(argv=None) -> argparse.Namespace:
     ))
     p.add_argument("--compile",         action="store_true")
     p.add_argument("--save_checkpoint", action="store_true")
-    p.add_argument("--no_filter_long",  action="store_true",
-                   help="Disable filtering of sequences longer than block_size")
+    p.add_argument("--filter_long",     action="store_true",
+                   help="Drop sequences longer than block_size instead of chunking them. "
+                        "Default is chunking (consistent with test-eval protocol).")
     p.add_argument("--grad_accum",      type=int, default=1,
                    help="Gradient accumulation steps. Effective batch = batch_size x grad_accum. "
                         "Helps stabilize training with variable-length per-sequence batches.")
 
     # LR sweep options
     p.add_argument("--lr_sweep_min", type=float, default=1e-5)
-    p.add_argument("--lr_sweep_max", type=float, default=1e-2)
-    p.add_argument("--n_lrs",        type=int,   default=7)
+    p.add_argument("--lr_sweep_max", type=float, default=1e-1)
+    p.add_argument("--n_lrs",        type=int,   default=9)
 
     return p.parse_args(argv)
 

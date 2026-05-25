@@ -107,33 +107,60 @@ python tokenizer.py --vocab-size 4096
 
 ### Training usage (`transformer/train.py`)
 
+#### Step 1 — Find the best learning rate
+
 ```bash
-# LR sweep on Tiny model (use --max_steps to limit compute):
+# Sweep 9 LRs (1e-5 → 1e-1) on the Tiny model; train 3000 steps per LR.
+# Diverged runs (NaN loss) are detected early and skipped automatically.
 python transformer/train.py --mode lr_sweep --max_steps 3000
 
-# Train each model size for 1 full epoch with the best LR:
-python transformer/train.py --model_size tiny   --lr 1e-2 --save_checkpoint
-python transformer/train.py --model_size small  --lr 1e-2 --save_checkpoint
-python transformer/train.py --model_size medium --lr 1e-2 --save_checkpoint
-python transformer/train.py --model_size large  --lr 1e-2 --save_checkpoint
-python transformer/train.py --model_size xl     --lr 1e-2 --save_checkpoint
+# Sweep on a specific model size (e.g. Medium, for a cross-check):
+python transformer/train.py --mode lr_sweep --max_steps 3000 --sweep_model_size medium
+
+# Fair SP baseline: sweep every model size independently and save per-size best LRs.
+# Use this to compare SP-per-size-tuned-LR vs µP-transfer on equal footing.
+python transformer/train.py --mode per_size_sweep --max_steps 3000
 ```
 
-**Key options:**
+Results are saved to:
+- `transformer/runs/lr_sweep_<model_size>.json` — per-LR val loss and divergence flag
+- `transformer/runs/lr_sweep_per_size.json` — per-size best LRs (per-size sweep only)
+
+#### Step 2 — Train each model size
+
+```bash
+# Train each model size for 1 full epoch with the best LR from the sweep:
+python transformer/train.py --model_size tiny   --lr <best_lr> --save_checkpoint
+python transformer/train.py --model_size small  --lr <best_lr> --save_checkpoint
+python transformer/train.py --model_size medium --lr <best_lr> --save_checkpoint
+python transformer/train.py --model_size large  --lr <best_lr> --save_checkpoint
+python transformer/train.py --model_size xl     --lr <best_lr> --save_checkpoint
+
+# Reduce batch size for large models if OOM:
+python transformer/train.py --model_size xl --lr <best_lr> --batch_size 8 --save_checkpoint
+```
+
+Results go to `transformer/runs/<size>_lr<lr>_results.json`. Checkpoints go to `transformer/runs/<size>_lr<lr>_ckpt.pt`.
+
+**All options:**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--mode` | `train` | `train` · `lr_sweep` · `per_size_sweep` |
 | `--model_size` | `tiny` | One of: tiny, small, medium, large, xl |
-| `--lr` | `1e-2` | Peak learning rate |
+| `--lr` | `3e-4` | Peak learning rate |
 | `--batch_size` | `16` | Sequences per gradient step |
 | `--block_size` | `1024` | Context window length in tokens |
 | `--max_steps` | full epoch | Limit training to N optimizer steps |
 | `--grad_clip` | `1.0` | Max gradient norm (0 = disabled) |
 | `--save_checkpoint` | off | Save `.pt` checkpoint after training |
+| `--filter_long` | off | Drop sequences > block\_size instead of chunking them. Default chunks long sequences into block\_size windows, matching test-eval protocol. |
 | `--compile` | off | Wrap model with `torch.compile()` (PyTorch ≥ 2.0) |
 | `--device` | auto | `cuda` > `mps` > `cpu` |
-
-Results are written to `transformer/runs/<size>_lr<lr>_results.json`. Checkpoints go to `transformer/runs/<size>_lr<lr>_ckpt.pt`.
+| `--lr_sweep_min` | `1e-5` | Lower bound of LR sweep grid |
+| `--lr_sweep_max` | `1e-1` | Upper bound of LR sweep grid |
+| `--n_lrs` | `9` | Number of log-spaced LR values to test |
+| `--sweep_model_size` | `tiny` | Model size used for `lr_sweep` mode |
 
 ### Scaling plot (`transformer/scaling_plot.py`)
 
@@ -161,31 +188,56 @@ python transformer/scaling_plot.py --runs_dir transformer/runs --out transformer
 
 muP allows the optimal learning rate found on the Tiny model to transfer zero-shot to all larger widths.
 
-```bash
-# muP LR sweep on Tiny (base shapes are generated automatically):
-python transformer/train_mup.py --mode lr_sweep --max_steps 3000
+#### Step 1 — Find the best muP LR
 
-# Train each model size with the best muP LR:
+```bash
+# Sweep 9 LRs (1e-5 → 1e-1) on the Tiny muP model.
+# Base shape files (.bsh) are generated automatically on first run.
+# Diverged runs are detected and skipped.
+python transformer/train_mup.py --mode lr_sweep --max_steps 3000
+```
+
+Results go to `transformer/runs/mup/lr_sweep_mup.json`.
+
+#### Step 2 — Train each model size
+
+```bash
+# Single epoch:
 python transformer/train_mup.py --model_size tiny   --lr <best_lr> --save_checkpoint
 python transformer/train_mup.py --model_size small  --lr <best_lr> --save_checkpoint
 python transformer/train_mup.py --model_size medium --lr <best_lr> --save_checkpoint
 python transformer/train_mup.py --model_size large  --lr <best_lr> --save_checkpoint
 python transformer/train_mup.py --model_size xl     --lr <best_lr> --save_checkpoint
 
-# Multi-epoch training with gradient accumulation:
+# Multi-epoch with gradient accumulation (cosine schedule spans all epochs):
 python transformer/train_mup.py --model_size large --lr <best_lr> \
     --n_epochs 2 --grad_accum 4 --save_checkpoint
 ```
+
+#### Resuming from a checkpoint
+
+The cosine schedule is saved in every checkpoint (`step` + `total_steps`). When resuming, the schedule continues from exactly where it left off — it does **not** restart from the peak LR.
+
+```bash
+# Continue an existing 2-epoch checkpoint for 1 more epoch:
+python transformer/train_mup.py --model_size xl --lr <best_lr> \
+    --n_epochs 1 --resume_ckpt transformer/runs/mup/xl_lr1e-02_2ep_mup_ckpt.pt \
+    --save_checkpoint
+```
+
+muP results go to `transformer/runs/mup/`. Base shape files (`.bsh`) are generated once per model topology and cached there.
 
 **Additional options vs `train.py`:**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--n_epochs` | `1` | Number of full training epochs |
-| `--grad_accum` | `1` | Gradient accumulation steps (effective batch = batch_size × grad_accum) |
-| `--resume_ckpt` | — | Path to a `.pt` checkpoint to resume weights from |
-
-muP results go to `transformer/runs/mup/`. Base shape files (`.bsh`) are generated once per model topology and cached there.
+| `--n_epochs` | `1` | Number of full training epochs (cosine LR spans all epochs) |
+| `--grad_accum` | `1` | Gradient accumulation steps (effective batch = batch\_size × grad\_accum) |
+| `--resume_ckpt` | — | Path to a `.pt` checkpoint; restores weights and continues the cosine schedule |
+| `--filter_long` | off | Drop sequences > block\_size instead of chunking (same behavior as `train.py`) |
+| `--lr_sweep_min` | `1e-5` | Lower bound of muP LR sweep grid |
+| `--lr_sweep_max` | `1e-1` | Upper bound of muP LR sweep grid |
+| `--n_lrs` | `9` | Number of log-spaced LR values to test |
 
 ### Comparison plot (`transformer/scaling_plot_comparison.py`)
 

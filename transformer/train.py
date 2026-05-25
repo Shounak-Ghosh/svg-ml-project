@@ -31,6 +31,7 @@ Usage examples
   python transformer/train.py --model_size xl     --lr 1e-2 --save_checkpoint
 """
 
+import copy
 import sys
 import time
 import json
@@ -226,12 +227,14 @@ class SVGSequenceDataset(Dataset):
     """
     Per-sequence dataset: each item is one complete SVG ([BOS] … [EOS]).
 
-    filter_long=True (default): skips sequences longer than block_size+1 tokens,
-    which would be truncated and lose their closing </svg> tag. Only complete,
-    properly-closed SVGs are used for training.
+    filter_long=False (default): long sequences are split into non-overlapping
+    block_size windows, matching the chunking protocol used in quantitative_metrics.py.
+    This retains all training data including structurally complex long SVGs.
 
-    Requires pad_collate as the DataLoader's collate_fn to handle the
-    variable lengths that result from different SVG sizes.
+    filter_long=True (legacy): sequences longer than block_size+1 are dropped entirely.
+    Use only if you need to reproduce earlier runs that used this setting.
+
+    Requires pad_collate as the DataLoader's collate_fn to handle variable lengths.
     """
 
     def __init__(
@@ -239,39 +242,53 @@ class SVGSequenceDataset(Dataset):
         flat_tokens: np.ndarray,
         offsets: np.ndarray,
         block_size: int,
-        filter_long: bool = True,
+        filter_long: bool = False,
     ):
         self.data       = flat_tokens
-        self.offsets    = offsets        # shape (n_seqs + 1,)
         self.block_size = block_size
+        self.chunks: list[tuple[int, int]] = []  # (start, end) token-index pairs
 
         lengths = np.diff(offsets)
         if filter_long:
-            # Keep only sequences that fit entirely within block_size tokens.
-            # A sequence of length L needs L tokens for input + target shift,
-            # so we need L ≤ block_size + 1.
-            mask = lengths <= block_size + 1
-            self.valid_indices = np.where(mask)[0]
-            n_total   = len(lengths)
-            n_kept    = int(mask.sum())
-            n_dropped = n_total - n_kept
+            # Legacy: drop sequences longer than block_size+1 (loses ~6.8% of data)
+            n_total = len(lengths)
+            for i, L in enumerate(lengths):
+                if L <= block_size + 1:
+                    self.chunks.append((int(offsets[i]), int(offsets[i + 1])))
+            n_kept = len(self.chunks)
             log.info(
                 f"SVGSequenceDataset: keeping {n_kept:,}/{n_total:,} complete sequences "
-                f"({n_kept/n_total*100:.1f}%); dropped {n_dropped:,} sequences "
+                f"({n_kept/n_total*100:.1f}%); dropped {n_total - n_kept:,} sequences "
                 f"longer than block_size={block_size}"
             )
         else:
-            self.valid_indices = np.arange(len(lengths))
+            # Default: chunk long sequences into non-overlapping block_size windows
+            n_short = 0
+            n_chunked = 0
+            for i, L in enumerate(lengths):
+                start = int(offsets[i])
+                end   = int(offsets[i + 1])
+                if L <= block_size + 1:
+                    self.chunks.append((start, end))
+                    n_short += 1
+                else:
+                    for cs in range(start, end, block_size):
+                        ce = min(cs + block_size + 1, end)
+                        if ce - cs > 1:
+                            self.chunks.append((cs, ce))
+                    n_chunked += 1
+            log.info(
+                f"SVGSequenceDataset: {n_short:,} complete + {n_chunked:,} chunked sequences "
+                f"= {len(self.chunks):,} training examples (block_size={block_size})"
+            )
 
     def __len__(self) -> int:
-        return len(self.valid_indices)
+        return len(self.chunks)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
-        real_idx = int(self.valid_indices[idx])
-        start    = int(self.offsets[real_idx])
-        end      = int(self.offsets[real_idx + 1])
-        # Truncate as a safety net (should be a no-op when filter_long=True)
-        seq = self.data[start : min(end, start + self.block_size + 1)].astype(np.int64)
+        start, end = self.chunks[idx]
+        seq = self.data[start:end].astype(np.int64)
+        seq = seq[:self.block_size + 1]  # safety cap
         x = torch.from_numpy(seq[:-1])
         y = torch.from_numpy(seq[1:])
         return x, y
@@ -407,7 +424,7 @@ def train(args: argparse.Namespace) -> dict:
     val_tokens, val_offsets = tokenize_file_to_sequences(
         args.val_path, tokenizer, flat_cache("val"), offsets_cache("val"))
 
-    filter_long = not args.no_filter_long
+    filter_long = args.filter_long
     train_ds = SVGSequenceDataset(train_tokens, train_offsets, args.block_size, filter_long=filter_long)
     val_ds   = SVGSequenceDataset(val_tokens,   val_offsets,   args.block_size, filter_long=filter_long)
 
@@ -461,6 +478,7 @@ def train(args: argparse.Namespace) -> dict:
         "model_size":   args.model_size,
         "n_params":     n_params,
         "lr":           args.lr,
+        "diverged":     False,
         "train_losses": [],          # list of {step, loss, lr}
         "val_loss":     None,
         "wall_clock_s": None,
@@ -490,6 +508,12 @@ def train(args: argparse.Namespace) -> dict:
         # Forward + backward
         with ctx:
             _, loss = model(x, y)
+
+        if not math.isfinite(loss.item()):
+            log.warning(f"Training diverged (loss={loss.item()}) at step {step}; aborting run.")
+            results["diverged"] = True
+            results["val_loss"] = float("nan")
+            return results
 
         scaler.scale(loss).backward()
         if args.grad_clip > 0.0:
@@ -577,13 +601,13 @@ def train(args: argparse.Namespace) -> dict:
 
 def run_lr_sweep(args: argparse.Namespace) -> float:
     """
-    Sweep learning rates on the Tiny model to find the best LR.
+    Sweep learning rates on a single model size to find the best LR.
 
     Tests --n_lrs values log-spaced in [--lr_sweep_min, --lr_sweep_max].
-    Each run trains for --max_steps steps (defaults to the full epoch if not set;
-    recommend --max_steps 3000 for a practical sweep on a single GPU).
+    Each run trains for --max_steps steps (recommend --max_steps 3000 for speed).
+    Diverged runs (NaN/inf loss) are skipped when selecting the best LR.
 
-    Returns the best learning rate (lowest val_loss).
+    Returns the best learning rate (lowest val_loss among converged runs).
     [Original implementation for this project]
     """
     lrs: list[float] = np.logspace(
@@ -592,33 +616,75 @@ def run_lr_sweep(args: argparse.Namespace) -> float:
         args.n_lrs,
     ).tolist()
 
-    log.info(f"LR sweep on 'tiny' over {args.n_lrs} values: {[f'{lr:.2e}' for lr in lrs]}")
+    sweep_model = getattr(args, "sweep_model_size", "tiny")
+    log.info(f"LR sweep on '{sweep_model}' over {args.n_lrs} values: {[f'{lr:.2e}' for lr in lrs]}")
 
-    args.model_size = "tiny"
+    args_copy = copy.copy(args)
+    args_copy.model_size = sweep_model
     sweep_results: list[dict] = []
 
     for lr in lrs:
         log.info(f"\n{'=' * 60}\nSweeping LR = {lr:.2e}\n{'=' * 60}")
-        args.lr = lr
-        result  = train(args)
-        entry   = {"lr": lr, "val_loss": result["val_loss"]}
+        args_copy.lr = lr
+        result  = train(args_copy)
+        entry   = {
+            "lr":       lr,
+            "val_loss": result["val_loss"],
+            "diverged": result.get("diverged", False),
+        }
         sweep_results.append(entry)
-        log.info(f"  LR {lr:.2e}  ->  val_loss {result['val_loss']:.4f}")
+        if result.get("diverged"):
+            log.info(f"  LR {lr:.2e}  -> DIVERGED (skipping)")
+        else:
+            log.info(f"  LR {lr:.2e}  ->  val_loss {result['val_loss']:.4f}")
 
     # Save sweep summary
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    sweep_path = out_dir / "lr_sweep.json"
+    sweep_path = out_dir / f"lr_sweep_{sweep_model}.json"
     with open(sweep_path, "w") as f:
-        json.dump({"sweep": sweep_results}, f, indent=2)
+        json.dump({"sweep": sweep_results, "model_size": sweep_model}, f, indent=2)
     log.info(f"LR sweep results -> {sweep_path}")
 
-    best = min(sweep_results, key=lambda r: r["val_loss"])
+    valid = [r for r in sweep_results if not r.get("diverged")]
+    if not valid:
+        log.warning("All LR values diverged — returning smallest LR as fallback.")
+        return float(lrs[0])
+    best = min(valid, key=lambda r: r["val_loss"])
     log.info(
         f"\nBest LR: {best['lr']:.2e}  (val_loss={best['val_loss']:.4f})\n"
         f"Use:  --lr {best['lr']:.2e}  for all model sizes in Part 2."
     )
     return float(best["lr"])
+
+
+def run_per_size_sweep(args: argparse.Namespace) -> dict:
+    """
+    Run a separate LR sweep for every model size — the honest SP baseline.
+
+    This enables a fair comparison between:
+      - µP: single LR found on Tiny, transferred zero-shot to all sizes
+      - SP:  per-size tuned LR (this function)
+
+    Saves per-size best LRs to out_dir/lr_sweep_per_size.json.
+    [Original implementation for this project]
+    """
+    per_size_best: dict[str, float] = {}
+    for size in MODEL_CONFIGS:
+        log.info(f"\n{'#' * 60}\nPer-size sweep: model_size={size}\n{'#' * 60}")
+        args_copy = copy.copy(args)
+        args_copy.sweep_model_size = size
+        best_lr = run_lr_sweep(args_copy)
+        per_size_best[size] = best_lr
+        log.info(f"  Best LR for {size}: {best_lr:.2e}")
+
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "lr_sweep_per_size.json"
+    with open(out, "w") as f:
+        json.dump(per_size_best, f, indent=2)
+    log.info(f"Per-size LR sweep results -> {out}")
+    return per_size_best
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +699,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     # Mode
     p.add_argument(
-        "--mode", choices=["train", "lr_sweep"], default="train",
-        help="'train': single training run; 'lr_sweep': LR sweep on tiny model",
+        "--mode", choices=["train", "lr_sweep", "per_size_sweep"], default="train",
+        help="'train': single run; 'lr_sweep': LR sweep on --sweep_model_size; "
+             "'per_size_sweep': separate sweep for every model size (SP fair baseline)",
     )
 
     # Paths
@@ -680,17 +747,19 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="Wrap model with torch.compile() (PyTorch >= 2.0, CUDA recommended)")
     p.add_argument("--save_checkpoint", action="store_true",
                    help="Save model checkpoint after training")
-    p.add_argument("--no_filter_long",  action="store_true",
-                   help="Disable filtering of sequences longer than block_size "
-                        "(by default, truncated SVGs that lose </svg> are excluded)")
+    p.add_argument("--filter_long",     action="store_true",
+                   help="Drop sequences longer than block_size instead of chunking them. "
+                        "Default is chunking (consistent with test-eval protocol).")
 
     # LR sweep options
-    p.add_argument("--lr_sweep_min", type=float, default=1e-5,
+    p.add_argument("--lr_sweep_min",      type=float, default=1e-5,
                    help="Lower bound of LR sweep (log scale)")
-    p.add_argument("--lr_sweep_max", type=float, default=1e-2,
+    p.add_argument("--lr_sweep_max",      type=float, default=1e-1,
                    help="Upper bound of LR sweep (log scale)")
-    p.add_argument("--n_lrs",        type=int,   default=7,
+    p.add_argument("--n_lrs",             type=int,   default=9,
                    help="Number of LR values to test in the sweep")
+    p.add_argument("--sweep_model_size",  choices=list(MODEL_CONFIGS.keys()), default="tiny",
+                   help="Model size to sweep on (default: tiny). Use 'medium' for SP cross-check.")
 
     return p.parse_args(argv)
 
@@ -699,6 +768,9 @@ if __name__ == "__main__":
     args = parse_args()
     if args.mode == "lr_sweep":
         best_lr = run_lr_sweep(args)
-        log.info(f"Recommended LR for all model sizes: {best_lr:.2e}")
+        log.info(f"Recommended LR for '{args.sweep_model_size}': {best_lr:.2e}")
+    elif args.mode == "per_size_sweep":
+        per_size = run_per_size_sweep(args)
+        log.info(f"Per-size best LRs: {per_size}")
     else:
         train(args)
